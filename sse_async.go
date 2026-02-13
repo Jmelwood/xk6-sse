@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -51,15 +53,6 @@ type AsyncClient struct {
 	sseMetrics     *sseMetrics
 }
 
-// OpenAsyncParams contains parameters for opening an async SSE connection
-type OpenAsyncParams struct {
-	Method  string
-	Body    string
-	Headers http.Header
-	Timeout time.Duration
-	Jar     http.CookieJar
-}
-
 // OpenAsync opens an SSE connection asynchronously
 // It returns the client immediately, while the connection happens in the background.
 func (s *sse) OpenAsync(url string, paramsObj sobek.Value) (*AsyncClient, error) {
@@ -84,16 +77,20 @@ func (s *sse) OpenAsync(url string, paramsObj sobek.Value) (*AsyncClient, error)
 		tlsConfig.NextProtos = []string{"http/1.1"}
 	}
 
+	// Implementation of Connection Pooling via Transport configuration
+	transport := &http.Transport{
+		DialContext:         state.Dialer.DialContext,
+		Proxy:               http.ProxyFromEnvironment,
+		TLSClientConfig:     tlsConfig,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives: state.Options.NoConnectionReuse.ValueOrZero() ||
+			state.Options.NoVUConnectionReuse.ValueOrZero(),
+	}
+
 	httpClient := &http.Client{
-		// Note: We deliberately do NOT set a global Timeout here because SSE is a streaming protocol.
-		// The params.Timeout is used only for the initial connection handshake.
-		Transport: &http.Transport{
-			DialContext:     state.Dialer.DialContext,
-			Proxy:           http.ProxyFromEnvironment,
-			TLSClientConfig: tlsConfig,
-			DisableKeepAlives: state.Options.NoConnectionReuse.ValueOrZero() ||
-				state.Options.NoVUConnectionReuse.ValueOrZero(),
-		},
+		Transport: transport,
 	}
 
 	if params.Jar != nil {
@@ -117,100 +114,129 @@ func (s *sse) OpenAsync(url string, paramsObj sobek.Value) (*AsyncClient, error)
 		sseMetrics:     s.metrics,
 	}
 
-	// 4. Prepare Request
-	var bodyReader io.Reader
-	if params.Body != "" {
-		bodyReader = bytes.NewBufferString(params.Body)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, params.Method, url, bodyReader)
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Headers
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Connection", "keep-alive")
-	for k, v := range params.Headers {
-		req.Header.Set(k, v)
-	}
-
-	// Add Trace for System Tags (IP address)
-	trace := &httptrace.ClientTrace{
-		GotConn: func(connInfo httptrace.GotConnInfo) {
-			if state.Options.SystemTags.Has(metrics.TagIP) {
-				if ip, _, err2 := net.SplitHostPort(connInfo.Conn.RemoteAddr().String()); err2 == nil {
-					client.tagsAndMeta.SetSystemTagOrMeta(metrics.TagIP, ip)
-				}
-			}
-		},
-	}
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
-
-	client.request = req
-
-	// 5. Start Connection in Background
-	go client.connect(params.Timeout)
+	// Start Connection in Background with retry logic
+	go client.connectWithRetry(params)
 
 	return client, nil
 }
 
-// connect establishes the connection, emits HTTP metrics, and starts the read loop
-func (c *AsyncClient) connect(dialTimeout time.Duration) {
+func (c *AsyncClient) connectWithRetry(opts *asyncOptions) {
 	defer close(c.doneChan)
 
-	// We use a separate context for the dial timeout so we don't kill the stream later
-	dialCtx, dialCancel := context.WithTimeout(c.ctx, dialTimeout)
-	// We only want the timeout to apply to the initial Do(), not the body reading
-	// However, http.Client.Do respects the Request context.
-	// To strictly enforce connect timeout without killing the stream, we rely on the Transport/Dialer
-	// configuration from k6 state, but here we can check timing manually or rely on k6's global timeouts.
-	// For simplicity in this async pattern, we proceed with the standard request context.
-	_ = dialCtx // logic placeholder
-	dialCancel()
+	var bodyBytes []byte
+	if opts.Body != "" {
+		bodyBytes = []byte(opts.Body)
+	}
 
-	start := time.Now()
-	resp, err := c.httpClient.Do(c.request)
-	end := time.Now()
+	for attempt := 0; attempt <= opts.MaxRetries; attempt++ {
+		// Check for context cancellation before starting an attempt
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
 
-	// Metrics: Connect Duration
-	if c.samplesOutput != nil {
-		metrics.PushIfNotDone(c.ctx, c.samplesOutput, metrics.ConnectedSamples{
-			Samples: []metrics.Sample{
-				{
-					TimeSeries: metrics.TimeSeries{
-						Metric: c.builtinMetrics.HTTPReqSending,
-						Tags:   c.tagsAndMeta.Tags,
-					},
-					Time:     start,
-					Metadata: c.tagsAndMeta.Metadata,
-					Value:    metrics.D(end.Sub(start)),
-				},
+		// Exponential Backoff with Jitter logic
+		if attempt > 0 {
+			// Calculate delay: base * 2^(attempt-1)
+			backoffFactor := math.Pow(2, float64(attempt-1))
+			delay := time.Duration(float64(opts.BaseDelay) * backoffFactor)
+			if delay > opts.MaxDelay {
+				delay = opts.MaxDelay
+			}
+
+			// Add 20% jitter
+			jitter := time.Duration(rand.Float64() * 0.2 * float64(delay))
+			sleepTime := delay + jitter
+
+			select {
+			case <-time.After(sleepTime):
+			case <-c.ctx.Done():
+				return
+			}
+		}
+
+		// Re-create request for each attempt
+		req, err := http.NewRequestWithContext(c.ctx, opts.Method, c.url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			c.setError(fmt.Errorf("request creation failed: %w", err))
+			return
+		}
+
+		// Apply headers
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Connection", "keep-alive")
+		for k, v := range opts.Headers {
+			req.Header.Set(k, v)
+		}
+
+		// Trace for IP tags
+		trace := &httptrace.ClientTrace{
+			GotConn: func(connInfo httptrace.GotConnInfo) {
+				if c.vu.State().Options.SystemTags.Has(metrics.TagIP) {
+					if ip, _, err2 := net.SplitHostPort(connInfo.Conn.RemoteAddr().String()); err2 == nil {
+						c.tagsAndMeta.SetSystemTagOrMeta(metrics.TagIP, ip)
+					}
+				}
 			},
-			Tags: c.tagsAndMeta.Tags,
-			Time: start,
-		})
-	}
+		}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+		c.request = req
 
-	if err != nil {
-		c.setError(fmt.Errorf("connection failed: %w", err))
+		// Metrics and Request
+		start := time.Now()
+		resp, err := c.httpClient.Do(req)
+		end := time.Now()
+
+		if c.samplesOutput != nil {
+			metrics.PushIfNotDone(c.ctx, c.samplesOutput, metrics.ConnectedSamples{
+				Samples: []metrics.Sample{
+					{
+						TimeSeries: metrics.TimeSeries{
+							Metric: c.builtinMetrics.HTTPReqSending,
+							Tags:   c.tagsAndMeta.Tags,
+						},
+						Time:     start,
+						Metadata: c.tagsAndMeta.Metadata,
+						Value:    metrics.D(end.Sub(start)),
+					},
+				},
+				Tags: c.tagsAndMeta.Tags,
+				Time: start,
+			})
+		}
+
+		if err != nil {
+			// Network error
+			if attempt == opts.MaxRetries {
+				c.setError(fmt.Errorf("connection failed after %d retries: %v", attempt, err))
+				return
+			}
+			continue
+		}
+
+		// Update Status Tag
+		if c.vu.State().Options.SystemTags.Has(metrics.TagStatus) {
+			c.tagsAndMeta.SetSystemTagOrMeta(metrics.TagStatus, strconv.Itoa(resp.StatusCode))
+		}
+
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			if attempt == opts.MaxRetries {
+				c.setError(fmt.Errorf("unexpected status code: %d", resp.StatusCode))
+				return
+			}
+			continue
+		}
+
+		// Handshake successful
+		c.handleSuccessfulConnect(resp, start)
 		return
 	}
+}
 
-	// Update Status Tag
-	if c.vu.State().Options.SystemTags.Has(metrics.TagStatus) {
-		c.tagsAndMeta.SetSystemTagOrMeta(metrics.TagStatus, strconv.Itoa(resp.StatusCode))
-	}
-
-	// Validation
-	if resp.StatusCode != 200 {
-		resp.Body.Close()
-		c.setError(fmt.Errorf("unexpected status code: %d", resp.StatusCode))
-		return
-	}
-
+func (c *AsyncClient) handleSuccessfulConnect(resp *http.Response, start time.Time) {
 	contentType := resp.Header.Get("Content-Type")
 	if !strings.Contains(strings.ToLower(contentType), "text/event-stream") {
 		resp.Body.Close()
@@ -233,7 +259,7 @@ func (c *AsyncClient) connect(dialTimeout time.Duration) {
 		}
 		c.mu.Unlock()
 
-		// Metrics: Request Duration (Close)
+		// Push final request metrics
 		finish := time.Now()
 		if c.samplesOutput != nil {
 			metrics.PushIfNotDone(c.ctx, c.samplesOutput, metrics.ConnectedSamples{
@@ -293,7 +319,6 @@ func (c *AsyncClient) readEvents() {
 			return
 		}
 
-		// Parsing logic ported from sse.go for consistency
 		switch {
 		// id of event
 		case hasPrefix(line, "id: "):
@@ -320,8 +345,7 @@ func (c *AsyncClient) readEvents() {
 			buf.Write(line[5:])
 
 		case hasPrefix(line, "retry:"):
-			// Retry logic is often handled by the client automatically,
-			// but for this async client, we just ignore it or could expose it later.
+			// ignore
 
 		// end of event
 		case isLineEnd(line):
@@ -360,8 +384,7 @@ func (c *AsyncClient) readEvents() {
 			}
 
 		default:
-			// Unrecognized line, ignore or log?
-			// sse.go logs this to errorChan, we can store it or ignore.
+			// ignore unknown
 		}
 	}
 }
@@ -440,15 +463,18 @@ func (c *AsyncClient) WaitForEvent(predicateFn sobek.Value, timeoutMs int) (Even
 // WaitForEventAsync returns a Promise that resolves when the event is received
 func (c *AsyncClient) WaitForEventAsync(predicateFn sobek.Value, timeoutMs int) *sobek.Promise {
 	promise, resolve, reject := promises.New(c.vu)
-  	callbackChan := make(chan func(func() error), 1)
-    callbackChan <- c.vu.RegisterCallback()
+
+	callbackChan := make(chan func(func() error), 1)
+
+	// Initial registration
+	callbackChan <- c.vu.RegisterCallback()
 
 	go func() {
 		// Quick check before waiting
 		c.mu.RLock()
 		if c.isClosed {
 			c.mu.RUnlock()
-            cb := <-callbackChan
+			cb := <-callbackChan
 			cb(func() error {
 				reject(fmt.Errorf("client is closed"))
 				return nil
@@ -603,6 +629,9 @@ type asyncOptions struct {
 	Timeout     time.Duration
 	Jar         http.CookieJar
 	tagsAndMeta *metrics.TagsAndMeta
+	MaxRetries int
+	BaseDelay  time.Duration
+	MaxDelay   time.Duration
 }
 
 func parseAsyncOptions(vu modules.VU, url string, paramsObj sobek.Value) (*asyncOptions, error) {
@@ -611,9 +640,12 @@ func parseAsyncOptions(vu modules.VU, url string, paramsObj sobek.Value) (*async
 
 	// Default options
 	opts := &asyncOptions{
-		Method:  "GET",
-		Headers: make(map[string]string),
-		Timeout: 60 * time.Second, // Default connect timeout
+		Method:     "GET",
+		Headers:    make(map[string]string),
+		Timeout:    60 * time.Second,
+		MaxRetries: 0,
+		BaseDelay:  1000 * time.Millisecond,
+		MaxDelay:   30000 * time.Millisecond,
 	}
 
 	// Capture initial tags
@@ -673,7 +705,21 @@ func parseAsyncOptions(vu modules.VU, url string, paramsObj sobek.Value) (*async
 		}
 	}
 
-	// Parse CookieJar
+	// Retry Options
+	if val := paramsMap.Get("maxRetries"); val != nil && !sobek.IsUndefined(val) {
+		opts.MaxRetries = int(val.ToInteger())
+	}
+	if val := paramsMap.Get("baseDelay"); val != nil && !sobek.IsUndefined(val) {
+		if t := val.ToInteger(); t > 0 {
+			opts.BaseDelay = time.Duration(t) * time.Millisecond
+		}
+	}
+	if val := paramsMap.Get("maxDelay"); val != nil && !sobek.IsUndefined(val) {
+		if t := val.ToInteger(); t > 0 {
+			opts.MaxDelay = time.Duration(t) * time.Millisecond
+		}
+	}
+
 	if jarValue := paramsMap.Get("jar"); jarValue != nil && !sobek.IsUndefined(jarValue) {
 		// Try to unwrap k6 http.CookieJar
 		if exported := jarValue.Export(); exported != nil {
