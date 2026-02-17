@@ -420,8 +420,14 @@ func (c *AsyncClient) WaitForEvent(predicateFn sobek.Value, timeoutMs int) (Even
 
 	rt := c.vu.Runtime()
 
-	timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
-	defer timer.Stop()
+	// Create a nil channel by default. Reading from a nil channel blocks forever,
+    // which effectively disables the timeout case in the select block below.
+    var timeoutChan <-chan time.Time
+    if timeoutMs > 0 {
+    	timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+    	defer timer.Stop()
+    	timeoutChan = timer.C
+    }
 
 	for {
 		select {
@@ -445,7 +451,7 @@ func (c *AsyncClient) WaitForEvent(predicateFn sobek.Value, timeoutMs int) (Even
 				return event, nil
 			}
 
-		case <-timer.C:
+		case <-timeoutChan:
 			return Event{}, fmt.Errorf("timeout waiting for event")
 
 		case <-c.doneChan:
@@ -483,8 +489,14 @@ func (c *AsyncClient) WaitForEventAsync(predicateFn sobek.Value, timeoutMs int) 
 		}
 		c.mu.RUnlock()
 
-		timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
-		defer timer.Stop()
+    	// Create a nil channel by default. Reading from a nil channel blocks forever,
+        // which effectively disables the timeout case in the select block below.
+        var timeoutChan <-chan time.Time
+		if timeoutMs > 0 {
+			timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+			defer timer.Stop()
+			timeoutChan = timer.C
+		}
 
 		for {
 			select {
@@ -538,7 +550,7 @@ func (c *AsyncClient) WaitForEventAsync(predicateFn sobek.Value, timeoutMs int) 
 					return
 				}
 
-			case <-timer.C:
+			case <-timeoutChan:
 				cb := <-callbackChan
 				cb(func() error {
 					reject(fmt.Errorf("timeout waiting for event"))
