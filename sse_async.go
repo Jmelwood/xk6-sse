@@ -4,12 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -138,108 +139,125 @@ func (c *AsyncClient) connectWithRetry(opts *asyncOptions) {
 
 		// Exponential Backoff with Jitter logic
 		if attempt > 0 {
-			// Calculate delay: base * 2^(attempt-1)
-			backoffFactor := math.Pow(2, float64(attempt-1))
-			delay := time.Duration(float64(opts.BaseDelay) * backoffFactor)
-			if delay > opts.MaxDelay {
-				delay = opts.MaxDelay
-			}
-
-			// Add 20% jitter
-			jitter := time.Duration(rand.Float64() * 0.2 * float64(delay))
-			sleepTime := delay + jitter
-
-			select {
-			case <-time.After(sleepTime):
-			case <-c.ctx.Done():
-				return
-			}
+			c.sleepForRetry(opts, attempt)
 		}
 
-		// Re-create request for each attempt
-		req, err := http.NewRequestWithContext(c.ctx, opts.Method, c.url, bytes.NewReader(bodyBytes))
-		if err != nil {
-			c.setError(fmt.Errorf("request creation failed: %w", err))
+		if success := c.doConnectAttempt(opts, attempt, bodyBytes); success {
 			return
 		}
+	}
+}
 
-		// Apply headers
-		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("Cache-Control", "no-cache")
-		req.Header.Set("Connection", "keep-alive")
-		for k, v := range opts.Headers {
-			req.Header.Set(k, v)
+func (c *AsyncClient) sleepForRetry(opts *asyncOptions, attempt int) {
+	backoffFactor := math.Pow(2, float64(attempt-1))
+	delay := time.Duration(float64(opts.BaseDelay) * backoffFactor)
+	if delay > opts.MaxDelay {
+		delay = opts.MaxDelay
+	}
+
+	// Use crypto/rand for secure jitter calculation
+	// Add 20% jitter
+	maxJitter := int64(float64(delay) * 0.2)
+	var jitter time.Duration
+	if maxJitter > 0 {
+		if n, err := rand.Int(rand.Reader, big.NewInt(maxJitter)); err == nil {
+			jitter = time.Duration(n.Int64())
 		}
+	}
 
-		// Trace for IP tags
-		trace := &httptrace.ClientTrace{
-			GotConn: func(connInfo httptrace.GotConnInfo) {
-				if c.vu.State().Options.SystemTags.Has(metrics.TagIP) {
-					if ip, _, err2 := net.SplitHostPort(connInfo.Conn.RemoteAddr().String()); err2 == nil {
-						c.tagsAndMeta.SetSystemTagOrMeta(metrics.TagIP, ip)
-					}
+	select {
+	case <-time.After(delay + jitter):
+	case <-c.ctx.Done():
+	}
+}
+
+// Re-create request for each attempt
+func (c *AsyncClient) doConnectAttempt(opts *asyncOptions, attempt int, bodyBytes []byte) bool {
+	req, err := http.NewRequestWithContext(c.ctx, opts.Method, c.url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		c.setError(fmt.Errorf("request creation failed: %w", err))
+		return true // Stop retrying
+	}
+
+	// Apply headers
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Connection", "keep-alive")
+	for k, v := range opts.Headers {
+		req.Header.Set(k, v)
+	}
+
+	// Trace for IP tags
+	trace := &httptrace.ClientTrace{
+		GotConn: func(connInfo httptrace.GotConnInfo) {
+			if c.vu.State().Options.SystemTags.Has(metrics.TagIP) {
+				if ip, _, err2 := net.SplitHostPort(connInfo.Conn.RemoteAddr().String()); err2 == nil {
+					c.tagsAndMeta.SetSystemTagOrMeta(metrics.TagIP, ip)
 				}
-			},
+			}
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	c.request = req
+
+	// Metrics and Request
+	start := time.Now()
+	//nolint:gosec // k6 is a load testing tool; the user intentionally specifies the target URL
+	resp, err := c.httpClient.Do(req)
+	end := time.Now()
+
+	c.pushConnectionMetrics(start, end)
+
+	if err != nil {
+		if attempt == opts.MaxRetries {
+			c.setError(fmt.Errorf("connection failed after %d retries: %w", attempt, err))
+			return true // Exhausted retries
 		}
-		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
-		c.request = req
+		return false // Retry
+	}
 
-		// Metrics and Request
-		start := time.Now()
-		resp, err := c.httpClient.Do(req)
-		end := time.Now()
+	// Update Status Tag
+	if c.vu.State().Options.SystemTags.Has(metrics.TagStatus) {
+		c.tagsAndMeta.SetSystemTagOrMeta(metrics.TagStatus, strconv.Itoa(resp.StatusCode))
+	}
 
-		if c.samplesOutput != nil {
-			metrics.PushIfNotDone(c.ctx, c.samplesOutput, metrics.ConnectedSamples{
-				Samples: []metrics.Sample{
-					{
-						TimeSeries: metrics.TimeSeries{
-							Metric: c.builtinMetrics.HTTPReqSending,
-							Tags:   c.tagsAndMeta.Tags,
-						},
-						Time:     start,
-						Metadata: c.tagsAndMeta.Metadata,
-						Value:    metrics.D(end.Sub(start)),
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		if attempt == opts.MaxRetries {
+			c.setError(fmt.Errorf("unexpected status code: %d", resp.StatusCode))
+			return true // Exhausted retries
+		}
+		return false // Retry
+	}
+
+	c.handleSuccessfulConnect(resp, start)
+	return true
+}
+
+func (c *AsyncClient) pushConnectionMetrics(start, end time.Time) {
+	if c.samplesOutput != nil {
+		metrics.PushIfNotDone(c.ctx, c.samplesOutput, metrics.ConnectedSamples{
+			Samples: []metrics.Sample{
+				{
+					TimeSeries: metrics.TimeSeries{
+						Metric: c.builtinMetrics.HTTPReqSending,
+						Tags:   c.tagsAndMeta.Tags,
 					},
+					Time:     start,
+					Metadata: c.tagsAndMeta.Metadata,
+					Value:    metrics.D(end.Sub(start)),
 				},
-				Tags: c.tagsAndMeta.Tags,
-				Time: start,
-			})
-		}
-
-		if err != nil {
-			// Network error
-			if attempt == opts.MaxRetries {
-				c.setError(fmt.Errorf("connection failed after %d retries: %v", attempt, err))
-				return
-			}
-			continue
-		}
-
-		// Update Status Tag
-		if c.vu.State().Options.SystemTags.Has(metrics.TagStatus) {
-			c.tagsAndMeta.SetSystemTagOrMeta(metrics.TagStatus, strconv.Itoa(resp.StatusCode))
-		}
-
-		if resp.StatusCode != 200 {
-			resp.Body.Close()
-			if attempt == opts.MaxRetries {
-				c.setError(fmt.Errorf("unexpected status code: %d", resp.StatusCode))
-				return
-			}
-			continue
-		}
-
-		// Handshake successful
-		c.handleSuccessfulConnect(resp, start)
-		return
+			},
+			Tags: c.tagsAndMeta.Tags,
+			Time: start,
+		})
 	}
 }
 
 func (c *AsyncClient) handleSuccessfulConnect(resp *http.Response, start time.Time) {
 	contentType := resp.Header.Get("Content-Type")
 	if !strings.Contains(strings.ToLower(contentType), "text/event-stream") {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		c.setError(fmt.Errorf("unexpected content-type: %s", contentType))
 		return
 	}
@@ -255,7 +273,7 @@ func (c *AsyncClient) handleSuccessfulConnect(resp *http.Response, start time.Ti
 		if c.response != nil && c.response.Body != nil {
 			// Drain body to allow connection reuse if possible
 			_, _ = io.Copy(io.Discard, c.response.Body)
-			c.response.Body.Close()
+			_ = c.response.Body.Close()
 		}
 		c.mu.Unlock()
 
@@ -265,22 +283,12 @@ func (c *AsyncClient) handleSuccessfulConnect(resp *http.Response, start time.Ti
 			metrics.PushIfNotDone(c.ctx, c.samplesOutput, metrics.ConnectedSamples{
 				Samples: []metrics.Sample{
 					{
-						TimeSeries: metrics.TimeSeries{
-							Metric: c.builtinMetrics.HTTPReqs,
-							Tags:   c.tagsAndMeta.Tags,
-						},
-						Time:     finish,
-						Metadata: c.tagsAndMeta.Metadata,
-						Value:    1,
+						TimeSeries: metrics.TimeSeries{Metric: c.builtinMetrics.HTTPReqs, Tags: c.tagsAndMeta.Tags},
+						Time:       finish, Value: 1,
 					},
 					{
-						TimeSeries: metrics.TimeSeries{
-							Metric: c.builtinMetrics.HTTPReqDuration,
-							Tags:   c.tagsAndMeta.Tags,
-						},
-						Time:     finish,
-						Metadata: c.tagsAndMeta.Metadata,
-						Value:    metrics.D(finish.Sub(start)),
+						TimeSeries: metrics.TimeSeries{Metric: c.builtinMetrics.HTTPReqDuration, Tags: c.tagsAndMeta.Tags},
+						Time:       finish, Value: metrics.D(finish.Sub(start)),
 					},
 				},
 				Tags: c.tagsAndMeta.Tags,
@@ -319,73 +327,77 @@ func (c *AsyncClient) readEvents() {
 			return
 		}
 
-		switch {
-		// id of event
-		case hasPrefix(line, "id: "):
-			ev.ID = stripPrefix(line, 4)
-		case hasPrefix(line, "id:"):
-			ev.ID = stripPrefix(line, 3)
-
-		// Comment
-		case hasPrefix(line, ": "):
-			ev.Comment = stripPrefix(line, 2)
-		case hasPrefix(line, ":"):
-			ev.Comment = stripPrefix(line, 1)
-
-		// name of event
-		case hasPrefix(line, "event: "):
-			ev.Name = stripPrefix(line, 7)
-		case hasPrefix(line, "event:"):
-			ev.Name = stripPrefix(line, 6)
-
-		// event data
-		case hasPrefix(line, "data: "):
-			buf.Write(line[6:])
-		case hasPrefix(line, "data:"):
-			buf.Write(line[5:])
-
-		case hasPrefix(line, "retry:"):
-			// ignore
-
-		// end of event
-		case isLineEnd(line):
-			// Trailing newlines are removed.
-			ev.Data = strings.TrimRightFunc(buf.String(), func(r rune) bool {
-				return r == '\r' || r == '\n'
-			})
-
-			// Only emit if we have data or an event name (ignore keep-alives)
-			if ev.Data != "" || ev.Name != "" {
-				// Metric: sse_events_received
-				if c.samplesOutput != nil && c.sseMetrics != nil {
-					metrics.PushIfNotDone(c.ctx, c.samplesOutput, metrics.Sample{
-						TimeSeries: metrics.TimeSeries{
-							Metric: c.sseMetrics.SSEEventReceived,
-							Tags:   c.tagsAndMeta.Tags,
-						},
-						Time:     time.Now(),
-						Metadata: c.tagsAndMeta.Metadata,
-						Value:    1,
-					})
-				}
-
-				// Send to channel, respecting context
-				select {
-				case c.eventChan <- ev:
-					buf.Reset()
-					ev = Event{}
-				case <-c.ctx.Done():
-					return
-				}
-			} else {
-				// Reset buffer even if we didn't emit (e.g. empty keep-alive)
-				buf.Reset()
-				ev = Event{}
-			}
-
-		default:
-			// ignore unknown
+		if c.processLine(line, &ev, &buf) {
+			return // Context done signaled inside processLine
 		}
+	}
+}
+
+func (c *AsyncClient) processLine(line []byte, ev *Event, buf *bytes.Buffer) bool {
+	switch {
+	// id of event
+	case hasPrefix(line, "id: "):
+		ev.ID = stripPrefix(line, 4)
+	case hasPrefix(line, "id:"):
+		ev.ID = stripPrefix(line, 3)
+
+	// Comment
+	case hasPrefix(line, ": "):
+		ev.Comment = stripPrefix(line, 2)
+	case hasPrefix(line, ":"):
+		ev.Comment = stripPrefix(line, 1)
+
+	// name of event
+	case hasPrefix(line, "event: "):
+		ev.Name = stripPrefix(line, 7)
+	case hasPrefix(line, "event:"):
+		ev.Name = stripPrefix(line, 6)
+
+	// event data
+	case hasPrefix(line, "data: "):
+		buf.Write(line[6:])
+	case hasPrefix(line, "data:"):
+		buf.Write(line[5:])
+
+	case hasPrefix(line, "retry:"):
+		// ignore
+
+	// end of event
+	case isLineEnd(line):
+		// Trailing newlines are removed.
+		ev.Data = strings.TrimRightFunc(buf.String(), func(r rune) bool {
+			return r == '\r' || r == '\n'
+		})
+
+		// Only emit if we have data or an event name (ignore keep-alives)
+		if ev.Data != "" || ev.Name != "" {
+			c.pushEventReceivedMetric()
+			select {
+			case c.eventChan <- *ev:
+				buf.Reset()
+				*ev = Event{}
+			case <-c.ctx.Done():
+				return true
+			}
+		} else {
+			buf.Reset()
+			*ev = Event{}
+		}
+	}
+	return false
+}
+
+func (c *AsyncClient) pushEventReceivedMetric() {
+	if c.samplesOutput != nil && c.sseMetrics != nil {
+		metrics.PushIfNotDone(c.ctx, c.samplesOutput, metrics.Sample{
+			TimeSeries: metrics.TimeSeries{
+				Metric: c.sseMetrics.SSEEventReceived,
+				Tags:   c.tagsAndMeta.Tags,
+			},
+			Time:     time.Now(),
+			Metadata: c.tagsAndMeta.Metadata,
+			Value:    1,
+		})
 	}
 }
 
@@ -418,48 +430,32 @@ func (c *AsyncClient) WaitForEvent(predicateFn sobek.Value, timeoutMs int) (Even
 	}
 	c.mu.RUnlock()
 
-	rt := c.vu.Runtime()
-
 	// Create a nil channel by default. Reading from a nil channel blocks forever,
-    // which effectively disables the timeout case in the select block below.
-    var timeoutChan <-chan time.Time
-    if timeoutMs > 0 {
-    	timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
-    	defer timer.Stop()
-    	timeoutChan = timer.C
-    }
+	// which effectively disables the timeout case in the select block below.
+	var timeoutChan <-chan time.Time
+	if timeoutMs > 0 {
+		timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+		defer timer.Stop()
+		timeoutChan = timer.C
+	}
 
 	for {
 		select {
 		case event := <-c.eventChan:
-			// No predicate = return first event
-			if predicateFn == nil || sobek.IsUndefined(predicateFn) || sobek.IsNull(predicateFn) {
-				return event, nil
-			}
-
-			callable, isCallable := sobek.AssertFunction(predicateFn)
-			if !isCallable {
-				return Event{}, fmt.Errorf("predicate is not a function")
-			}
-
-			result, err := callable(sobek.Undefined(), rt.ToValue(event))
+			match, err := c.evaluatePredicate(predicateFn, event)
 			if err != nil {
-				return Event{}, fmt.Errorf("predicate error: %w", err)
+				return Event{}, err
 			}
-
-			if result.ToBoolean() {
+			if match {
 				return event, nil
 			}
-
 		case <-timeoutChan:
 			return Event{}, fmt.Errorf("timeout waiting for event")
-
 		case <-c.doneChan:
 			if err := c.GetError(); err != nil {
 				return Event{}, err
 			}
 			return Event{}, fmt.Errorf("connection closed")
-
 		case <-c.ctx.Done():
 			return Event{}, fmt.Errorf("context cancelled")
 		}
@@ -489,9 +485,9 @@ func (c *AsyncClient) WaitForEventAsync(predicateFn sobek.Value, timeoutMs int) 
 		}
 		c.mu.RUnlock()
 
-    	// Create a nil channel by default. Reading from a nil channel blocks forever,
-        // which effectively disables the timeout case in the select block below.
-        var timeoutChan <-chan time.Time
+		// Create a nil channel by default. Reading from a nil channel blocks forever,
+		// which effectively disables the timeout case in the select block below.
+		var timeoutChan <-chan time.Time
 		if timeoutMs > 0 {
 			timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
 			defer timer.Stop()
@@ -508,40 +504,20 @@ func (c *AsyncClient) WaitForEventAsync(predicateFn sobek.Value, timeoutMs int) 
 				shouldExit := false
 
 				cb(func() error {
-					// --- We are now on the JS Thread ---
-
-					// 1. Check Predicate
-					match := false
-					if predicateFn == nil || sobek.IsUndefined(predicateFn) || sobek.IsNull(predicateFn) {
-						match = true
-					} else {
-						rt := c.vu.Runtime()
-						callable, isCallable := sobek.AssertFunction(predicateFn)
-						if !isCallable {
-							reject(fmt.Errorf("predicate is not a function"))
-							shouldExit = true
-							return nil
-						}
-
-						result, err := callable(sobek.Undefined(), rt.ToValue(event))
-						if err != nil {
-							reject(fmt.Errorf("predicate error: %w", err))
-							shouldExit = true
-							return nil
-						}
-						match = result.ToBoolean()
+					match, err := c.evaluatePredicate(predicateFn, event)
+					if err != nil {
+						reject(err)
+						shouldExit = true
+						return nil
 					}
 
 					if match {
 						resolve(event)
 						shouldExit = true
 					} else {
-						// 2. Recycle Callback
 						// If we didn't match, we need to listen for the next event.
 						// We are on the JS thread, so we can register a NEW callback.
-						newCb := c.vu.RegisterCallback()
-						// Send it back to the Go loop for the next iteration
-						callbackChan <- newCb
+						callbackChan <- c.vu.RegisterCallback()
 					}
 					return nil
 				})
@@ -584,18 +560,40 @@ func (c *AsyncClient) WaitForEventAsync(predicateFn sobek.Value, timeoutMs int) 
 	return promise
 }
 
+func (c *AsyncClient) evaluatePredicate(predicateFn sobek.Value, event Event) (bool, error) {
+	if predicateFn == nil || sobek.IsUndefined(predicateFn) || sobek.IsNull(predicateFn) {
+		return true, nil
+	}
+
+	rt := c.vu.Runtime()
+	callable, isCallable := sobek.AssertFunction(predicateFn)
+	if !isCallable {
+		return false, fmt.Errorf("predicate is not a function")
+	}
+
+	result, err := callable(sobek.Undefined(), rt.ToValue(event))
+	if err != nil {
+		return false, fmt.Errorf("predicate error: %w", err)
+	}
+
+	return result.ToBoolean(), nil
+}
+
+// IsOpen returns true if the connection is currently open.
 func (c *AsyncClient) IsOpen() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.isOpen
 }
 
+// GetError returns the last error encountered by the client.
 func (c *AsyncClient) GetError() error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.lastErr
 }
 
+// Close closes the SSE connection and cleans up background routines.
 func (c *AsyncClient) Close() error {
 	c.mu.Lock()
 	if c.isClosed {
@@ -615,6 +613,7 @@ func (c *AsyncClient) Close() error {
 	}
 }
 
+// GetStatus returns the HTTP status code of the connection handshake.
 func (c *AsyncClient) GetStatus() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -641,15 +640,13 @@ type asyncOptions struct {
 	Timeout     time.Duration
 	Jar         http.CookieJar
 	tagsAndMeta *metrics.TagsAndMeta
-	MaxRetries int
-	BaseDelay  time.Duration
-	MaxDelay   time.Duration
+	MaxRetries  int
+	BaseDelay   time.Duration
+	MaxDelay    time.Duration
 }
 
 func parseAsyncOptions(vu modules.VU, url string, paramsObj sobek.Value) (*asyncOptions, error) {
 	state := vu.State()
-	rt := vu.Runtime()
-
 	// Default options
 	opts := &asyncOptions{
 		Method:     "GET",
@@ -667,57 +664,55 @@ func parseAsyncOptions(vu modules.VU, url string, paramsObj sobek.Value) (*async
 
 	// Set default User-Agent
 	opts.Headers["User-Agent"] = state.Options.UserAgent.String
+	opts.Jar = state.CookieJar
 
 	// If no params object, return defaults
 	if paramsObj == nil || sobek.IsUndefined(paramsObj) || sobek.IsNull(paramsObj) {
 		return opts, nil
 	}
 
+	rt := vu.Runtime()
 	paramsMap := paramsObj.ToObject(rt)
 	if paramsMap == nil {
 		return opts, nil
 	}
 
-	// Parse Method
-	if method := paramsMap.Get("method"); method != nil && !sobek.IsUndefined(method) {
-		opts.Method = strings.ToUpper(method.String())
+	applyBasicOptions(rt, opts, paramsMap)
+	applyRetryOptions(opts, paramsMap)
+
+	if err := applyTagsAndJarOptions(rt, opts, paramsMap); err != nil {
+		return nil, err
 	}
 
-	// Parse Body
-	if body := paramsMap.Get("body"); body != nil && !sobek.IsUndefined(body) {
-		opts.Body = body.String()
-	}
+	return opts, nil
+}
 
-	// Parse Headers
-	if headers := paramsMap.Get("headers"); headers != nil && !sobek.IsUndefined(headers) {
-		headersObj := headers.ToObject(rt)
-		if headersObj != nil {
+func applyBasicOptions(rt *sobek.Runtime, opts *asyncOptions, paramsMap *sobek.Object) {
+	if val := paramsMap.Get("method"); val != nil && !sobek.IsUndefined(val) {
+		opts.Method = strings.ToUpper(val.String())
+	}
+	if val := paramsMap.Get("body"); val != nil && !sobek.IsUndefined(val) {
+		opts.Body = val.String()
+	}
+	if val := paramsMap.Get("headers"); val != nil && !sobek.IsUndefined(val) {
+		if headersObj := val.ToObject(rt); headersObj != nil {
 			for _, key := range headersObj.Keys() {
 				opts.Headers[key] = headersObj.Get(key).String()
 			}
 		}
 	}
-
-	// Parse Tags
-	if tags := paramsMap.Get("tags"); tags != nil && !sobek.IsUndefined(tags) {
-		if err := common.ApplyCustomUserTags(rt, opts.tagsAndMeta, tags); err != nil {
-			return nil, fmt.Errorf("invalid metric tags: %w", err)
-		}
-	}
-
-	// Parse Timeout
-	if timeout := paramsMap.Get("timeout"); timeout != nil && !sobek.IsUndefined(timeout) {
-		if t := timeout.ToInteger(); t > 0 {
+	if val := paramsMap.Get("timeout"); val != nil && !sobek.IsUndefined(val) {
+		if t := val.ToInteger(); t > 0 {
 			opts.Timeout = time.Duration(t) * time.Millisecond
-		} else if tStr := timeout.ToString().String(); tStr != "" {
-			d, err := time.ParseDuration(tStr)
-			if err == nil {
+		} else if tStr := val.ToString().String(); tStr != "" {
+			if d, err := time.ParseDuration(tStr); err == nil {
 				opts.Timeout = d
 			}
 		}
 	}
+}
 
-	// Retry Options
+func applyRetryOptions(opts *asyncOptions, paramsMap *sobek.Object) {
 	if val := paramsMap.Get("maxRetries"); val != nil && !sobek.IsUndefined(val) {
 		opts.MaxRetries = int(val.ToInteger())
 	}
@@ -731,7 +726,14 @@ func parseAsyncOptions(vu modules.VU, url string, paramsObj sobek.Value) (*async
 			opts.MaxDelay = time.Duration(t) * time.Millisecond
 		}
 	}
+}
 
+func applyTagsAndJarOptions(rt *sobek.Runtime, opts *asyncOptions, paramsMap *sobek.Object) error {
+	if tags := paramsMap.Get("tags"); tags != nil && !sobek.IsUndefined(tags) {
+		if err := common.ApplyCustomUserTags(rt, opts.tagsAndMeta, tags); err != nil {
+			return fmt.Errorf("invalid metric tags: %w", err)
+		}
+	}
 	if jarValue := paramsMap.Get("jar"); jarValue != nil && !sobek.IsUndefined(jarValue) {
 		// Try to unwrap k6 http.CookieJar
 		if exported := jarValue.Export(); exported != nil {
@@ -742,11 +744,5 @@ func parseAsyncOptions(vu modules.VU, url string, paramsObj sobek.Value) (*async
 			}
 		}
 	}
-
-	// If no custom jar, use the VU's default jar
-	if opts.Jar == nil {
-		opts.Jar = state.CookieJar
-	}
-
-	return opts, nil
+	return nil
 }
